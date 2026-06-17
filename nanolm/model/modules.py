@@ -4,6 +4,7 @@ from torch import nn, Tensor
 from jaxtyping import Bool, Float, Int
 from einops import einsum, rearrange
 from utils import softmax
+from typing import Optional
 
 class Linear(nn.Module):
     def __init__(self, in_features: int, out_features: int, device=None, dtype=None):
@@ -181,3 +182,61 @@ class TransformerLM(nn.Module):
             x = layer(x, position_tokens)
         x = self.final_norm(x)
         return self.lm_head(x)
+    
+    @torch.no_grad()
+    def generate(
+        self,
+        inputs: torch.Tensor,
+        max_output_tokens: int,
+        stop_token_id: Optional[int] = None,
+        temperature: float = 1.0,
+        top_p: Optional[float] = None,
+        top_k: Optional[int] = None
+    ):
+        assert temperature > 0, "Temperature must be greater than 0."
+        if len(inputs.shape) == 1:
+            inputs = inputs.unsqueeze(0)
+        
+        inputs_len = inputs.shape[-1]
+        for _ in range(max_output_tokens):
+            x = inputs[:, -self.context_length:]
+            output_logits = self.forward(x)
+            next_token_logits = output_logits[:, -1]
+            next_token_logits = next_token_logits / temperature
+
+            if top_k:
+                k = min(next_token_logits.shape[-1], top_k)
+                top_k_logits, _ = torch.topk(next_token_logits, k, dim=-1)
+
+                # remove_mask = torch.ones_like(next_token_logits, dtype=torch.bool)
+                # remove_mask.scatter_(dim=-1, index=top_k_indices, src=False)
+
+                threshold = top_k_logits[:, -1, None]
+                remove_mask = next_token_logits < threshold
+
+                next_token_logits.masked_fill_(remove_mask, float("-inf"))
+
+            if top_p:
+                sorted_logits, sorted_indices = torch.sort(next_token_logits, dim=-1, descending=True)
+                temp_softmax = softmax(sorted_logits, dim=-1)
+                cumsum_logits = torch.cumsum(temp_softmax, dim=-1)
+
+                sorted_remove_mask = cumsum_logits > top_p
+                sorted_remove_mask[:, 1:] = sorted_remove_mask[:, :-1].clone()
+                sorted_remove_mask[:, 0] = False
+
+                remove_mask = torch.zeros_like(sorted_remove_mask, dtype=torch.bool)
+                remove_mask.scatter_(dim=-1, index=sorted_indices, src=sorted_remove_mask)
+
+                next_token_logits.masked_fill_(remove_mask, float("-inf"))
+                # inverse_indice = torch.argsort(sorted_indices, dim=-1)
+                # next_token_logits = torch.gather(sorted_logits, dim=-1, index=inverse_indice)
+
+            softmax_outputs = softmax(next_token_logits, dim=-1)
+            next_ids = torch.multinomial(softmax_outputs, 1)
+            # TODO: This code only work well when batch size is 1, need to be improved.
+            if stop_token_id and next_ids.item() == stop_token_id:
+                break
+            inputs = torch.cat([inputs, next_ids], dim=-1)
+        new_token_ids = inputs[:, inputs_len:]
+        return new_token_ids

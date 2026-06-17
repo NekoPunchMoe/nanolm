@@ -1,9 +1,14 @@
 import os
 import regex
+import pickle
+from tqdm import tqdm
 from typing import BinaryIO
 from collections import Counter, defaultdict
 import multiprocessing
 from concurrent.futures import ProcessPoolExecutor, as_completed
+
+import hydra
+from omegaconf import DictConfig, OmegaConf
 
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 
@@ -132,7 +137,7 @@ def parallel_pre_tokenize(file_path: str, worker_num: int, special_tokens: list[
             end = chunk_boundaries[i + 1]
             futures.append(executor.submit(_worker_pre_tokenize, file_path, start, end, special_tokens))
 
-        for future in as_completed(futures):
+        for future in tqdm(as_completed(futures), total=len(futures), desc="Pre-tokenizing"):
             try:
                 worker_result = future.result()
                 master_counter.update(worker_result)
@@ -171,7 +176,7 @@ def merge_tokens(pre_token_count: dict[str, int], vocab_size: int, special_token
             pair_to_words[pair].add(word)
 
     # 2. 开始 Merge 循环
-    for _ in range(vocab_size - len(vocab)):
+    for _ in tqdm(range(vocab_size - len(vocab)), desc="Merging tokens"):
         if not pair_counts:
             break
             
@@ -234,3 +239,27 @@ def train_bpe_tokenizer(file_path: str, vocab_size: int, special_tokens: list[st
     bytes_special_tokens = [t.encode("utf-8") for t in special_tokens]
     pre_token_count = parallel_pre_tokenize(file_path, 10, bytes_special_tokens)
     return merge_tokens(pre_token_count, vocab_size, bytes_special_tokens)
+
+@hydra.main(version_base=None, config_path="configs", config_name="config")
+def main(cfg: DictConfig):
+    config_dict = OmegaConf.to_container(cfg, resolve=True)
+    file_path = cfg.tokenizer.corpus_path
+    vocab_size = cfg.tokenizer.vocab_size
+    special_tokens_path = cfg.tokenizer.special_tokens_path
+    with open(special_tokens_path, "r", encoding="utf-8") as f:
+        special_tokens = [line.strip() for line in f.read().split("\n") if line.strip()]
+
+    print("Special tokens:", special_tokens)
+    print("Special tokens length:", len(special_tokens))
+
+    vocab, merges = train_bpe_tokenizer(file_path, vocab_size, special_tokens)
+    print("Vocab size:", len(vocab))
+    print("Merges size:", len(merges))
+
+    with open(cfg.tokenizer.vocab_pkl_path, "wb") as f:
+        pickle.dump(vocab, f)
+    with open(cfg.tokenizer.merges_pkl_path, "wb") as f:
+        pickle.dump(merges, f)
+
+if __name__ == "__main__":
+    main()
